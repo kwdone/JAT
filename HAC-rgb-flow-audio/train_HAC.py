@@ -18,7 +18,16 @@ import copy
 # from mmengine.logging import MMLogger
 # logger = MMLogger.get_instance(name="my_logger")
 # logger.setLevel('ERROR')
-
+class StatAcc:
+    def __init__(self):
+        self.rows, self.keys = [], None
+    def add(self, stats):
+        self.keys = sorted(stats)
+        self.rows.append(torch.stack([stats[k].float() for k in self.keys]).cpu())
+    def summary(self):
+        x = torch.stack(self.rows)
+        return self.keys, x.mean(0).tolist(), x.std(0).tolist()
+    
 def train_one_step(clip, flow, spectrogram, labels, domain_labels, args,
                    model_video, model_flow, model_audio, mm_cls, criterion, optim):
     labels = labels.cuda()
@@ -88,6 +97,7 @@ def train_one_step(clip, flow, spectrogram, labels, domain_labels, args,
     local_domain_loss = labels.new_tensor(0.0, dtype=torch.float)
     global_domain_loss = labels.new_tensor(0.0, dtype=torch.float)
     entropies = []
+    dom_acc, modal_acc = [], []
 
     for modal_idx, modal_name in enumerate(modality_order):
         embedding = embeddings[modal_name]
@@ -95,13 +105,15 @@ def train_one_step(clip, flow, spectrogram, labels, domain_labels, args,
             modal_projectors[modal_name](grad_reverse(embedding, args.alpha_modal)))
         modal_labels = torch.full_like(labels, modal_idx)
         modal_adv_loss = modal_adv_loss + criterion(modal_logits, modal_labels)
-
+        modal_acc.append((modal_logits.argmax(1) == modal_labels).float().mean().detach())
+        
         if args.num_domains > 1:
             domain_logits = domain_disc(
                 domain_projectors[modal_name](grad_reverse(embedding, args.alpha_domain)))
             local_domain_loss = local_domain_loss + criterion(domain_logits, domain_labels)
             domain_prob = F.softmax(domain_logits, dim=1).clamp_min(1e-12)
             entropies.append(-(domain_prob * domain_prob.log()).sum(dim=1).mean())
+            dom_acc.append((domain_logits.argmax(1) == domain_labels).float().mean().detach())
 
     num_modalities = len(modality_order)
     modal_adv_loss = modal_adv_loss / num_modalities
@@ -112,7 +124,21 @@ def train_one_step(clip, flow, spectrogram, labels, domain_labels, args,
         global_domain_logits = domain_disc_global(
             grad_reverse(global_embedding, args.alpha_domain))
         global_domain_loss = criterion(global_domain_logits, domain_labels)
-        modality_weights = F.softmax(torch.stack(entropies) / args.weight_temperature, dim=0)
+        global_acc = (global_domain_logits.argmax(1) == domain_labels).float().mean().detach()
+
+        H = torch.stack(entropies)
+        T = args.weight_temperature
+        if args.weight_mode == 'entropy':            # released code (gradient flows through the weights)
+            modality_weights = F.softmax(H / T, dim=0)
+        elif args.weight_mode == 'entropy_detach':   # as the paper describes: weights treated as constants
+            modality_weights = F.softmax(H.detach() / T, dim=0)
+        elif args.weight_mode == 'inverted':
+            modality_weights = F.softmax(-H.detach() / T, dim=0)
+        elif args.weight_mode == 'shuffled':
+            w = F.softmax(H.detach() / T, dim=0)
+            modality_weights = w[torch.randperm(len(w), device=w.device)]
+        else:                                        # uniform
+            modality_weights = torch.full_like(H, 1.0 / len(H))
     else:
         modality_weights = torch.full(
             (num_modalities,), 1.0 / num_modalities, device=labels.device)
@@ -129,11 +155,28 @@ def train_one_step(clip, flow, spectrogram, labels, domain_labels, args,
         loss = loss + args.domain_adv_loss_local * local_domain_loss
         loss = loss + args.domain_adv_loss_global * global_domain_loss
 
+    if args.check_leak:
+        check_gradient_leak(
+            (('video', model_video), ('flow', model_flow), ('audio', model_audio),
+             ('mm_cls', mm_cls), ('modal_disc', modal_disc), ('domain_disc', domain_disc),
+             ('domain_disc_global', domain_disc_global)),
+            optim)
+
     optim.zero_grad()
     loss.backward()
     optim.step()
 
-    return mm_pred, loss
+    stats = {'L_fusion': fusion_loss.detach()}
+    for i, name in enumerate(modality_order):
+        stats[f'Lcls_{name}'] = unimodal_losses[name].detach()
+        stats[f'modacc_{name}'] = modal_acc[i]
+        if args.num_domains > 1:
+            stats[f'H_{name}'] = entropies[i].detach()
+            stats[f'alpha_{name}'] = modality_weights[i].detach()
+            stats[f'domacc_{name}'] = dom_acc[i]
+    if args.num_domains > 1:
+        stats['domacc_global'] = global_acc
+    return mm_pred, loss, stats
 
 def validate_one_step(clip, flow, spectrogram, labels, args, model_video, model_flow, model_audio, mm_cls, model_video_ema, model_flow_ema, model_audio_ema, mm_cls_ema, criterion):
     labels = labels.cuda()
@@ -347,8 +390,68 @@ def update_ema(student, ema, decay):
         else:
             ema_value.copy_(student_value)
 
+_LEAK_STATE = {'checked': False, 'last': None}
+
+def check_gradient_leak(modules, optim):
+    """--check_leak diagnostic: report parameters that received a gradient but are
+    deliberately kept out of the optimizer (the "frozen" part of the backbones).
+
+    It is called just before optim.zero_grad(), so the gradients inspected are the
+    ones left behind by the previous step; the very first call only sees None and
+    is skipped. It reports the first leak-free step once and then stays quiet.
+    """
+    optimised = {id(p) for group in optim.param_groups for p in group['params']}
+    leaked, seen_any = [], False
+    for name, module in modules:
+        if module is None:
+            continue
+        for param_name, param in module.named_parameters():
+            if param.grad is None:
+                continue
+            seen_any = True
+            if id(param) not in optimised:
+                leaked.append(f'{name}.{param_name}')
+    if not seen_any:
+        return
+
+    if leaked:
+        signature = tuple(leaked)
+        if signature != _LEAK_STATE['last']:
+            shown = ', '.join(leaked[:5]) + (' ...' if len(leaked) > 5 else '')
+            print(f'[leak] {len(leaked)} frozen parameter(s) received a gradient: {shown}')
+            _LEAK_STATE['last'] = signature
+    elif not _LEAK_STATE['checked']:
+        print('[leak] no frozen parameter received a gradient')
+    _LEAK_STATE['checked'] = True
+
+def git_commit_hash():
+    """Commit hash of the checkout, read straight from .git (no subprocess needed)."""
+    try:
+        path = osp.dirname(osp.abspath(__file__))
+        while True:
+            git_dir = osp.join(path, '.git')
+            if osp.isdir(git_dir):
+                with open(osp.join(git_dir, 'HEAD')) as head_file:
+                    head = head_file.read().strip()
+                if head.startswith('ref:'):
+                    with open(osp.join(git_dir, head[4:].strip())) as ref_file:
+                        return ref_file.read().strip()
+                return head
+            parent = osp.dirname(path)
+            if parent == path:
+                return 'unknown'
+            path = parent
+    except OSError:
+        return 'unknown'
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
+    # Dynamic weighting controller
+    parser.add_argument('--weight_mode', default='entropy',
+        choices=['entropy', 'entropy_detach', 'uniform', 'inverted', 'shuffled'])
+    parser.add_argument('--tag', default='')               # keeps runs from overwriting each other
+    parser.add_argument('--log_target_each_epoch', action='store_true')
+    parser.add_argument('--check_leak', action='store_true')
 
     # Hyperparameters
     parser.add_argument('--lr', type=float, default=1e-4)
@@ -384,6 +487,8 @@ if __name__ == '__main__':
     parser.add_argument("--BestEpoch", type=int, default=0)
     parser.add_argument('--BestValAcc', type=float, default=0)
     parser.add_argument('--BestTestAcc', type=float, default=0)
+    parser.add_argument('--keep_checkpoint', action='store_true',
+        help='keep the best checkpoint after the final test (deleted by default)')
 
     # System Settings
     parser.add_argument('--gpu', type=int, default=0)
@@ -505,8 +610,12 @@ if __name__ == '__main__':
     log_dir = osp.join(log_dir_base, dir_name)
     if not os.path.exists(log_dir):
         os.mkdir(log_dir)
-    model_path = osp.join(model_dir, f"{args.source_domain}_to_{args.target_domain}_seed{args.seed}.pt")
-    log_path = osp.join(log_dir, f"{args.source_domain}_to_{args.target_domain}_seed{args.seed}.csv")
+    # model_path = osp.join(model_dir, f"{args.source_domain}_to_{args.target_domain}_seed{args.seed}.pt")
+    # log_path = osp.join(log_dir, f"{args.source_domain}_to_{args.target_domain}_seed{args.seed}.csv")
+    tag = f"_{args.tag}" if args.tag else ""
+    model_path = osp.join(model_dir, f"{args.source_domain}_to_{args.target_domain}_seed{args.seed}{tag}.pt")
+    log_path = osp.join(log_dir, f"{args.source_domain}_to_{args.target_domain}_seed{args.seed}{tag}.csv")
+    stats_path = log_path.replace('.csv', '_stats.csv')
 
     criterion = nn.CrossEntropyLoss()
 
@@ -540,7 +649,14 @@ if __name__ == '__main__':
         test_dataloader1 = torch.utils.data.DataLoader(test_dataset1, batch_size=batch_size, num_workers=args.num_workers, shuffle=False, pin_memory=True, drop_last=False)
         test_dataloader2 = torch.utils.data.DataLoader(test_dataset2, batch_size=batch_size, num_workers=args.num_workers, shuffle=False, pin_memory=True, drop_last=False)
     dataloaders = {'train': train_dataloader, 'val': validate_dataloader}
-    with open(log_path, "a") as f:
+    if args.log_target_each_epoch and len(args.target_domain) == 1:
+        dataloaders['tgt'] = test_dataloader
+
+    with open(log_path, "w") as f, open(stats_path, "w") as stats_f:
+        f.write(f"# git_commit {git_commit_hash()}\n")
+        f.write(f"# args {vars(args)}\n")
+        f.flush()
+
         # ema model
         if args.use_video:
             model_video_ema = copy.deepcopy(model_video)
@@ -562,7 +678,8 @@ if __name__ == '__main__':
         # iteration
         for epoch_i in range(1, args.nepochs+1):
             print("Epoch: %02d" % epoch_i)
-            for split in ['train', 'val']:
+            acc_stats = StatAcc()
+            for split in [s for s in ('train', 'val', 'tgt') if s in dataloaders]:
                 acc = 0
                 count = 0
                 total_loss = 0
@@ -583,10 +700,11 @@ if __name__ == '__main__':
                 with tqdm.tqdm(total=len(dataloaders[split])) as pbar:
                     for (clip, flow, spectrogram, labels, domain_labels) in dataloaders[split]:
                         if split=='train':
-                            predict1, loss = train_one_step(
+                            predict1, loss, stats = train_one_step(
                                 clip, flow, spectrogram, labels, domain_labels, args,
                                 model_video, model_flow, model_audio, mm_cls,
                                 criterion, optim)
+                            acc_stats.add(stats)
                             if args.use_video:
                                 update_ema(model_video, model_video_ema, args.ema_beta)
                             if args.use_flow:
@@ -594,11 +712,14 @@ if __name__ == '__main__':
                             if args.use_audio:
                                 update_ema(model_audio, model_audio_ema, args.ema_beta)
                             update_ema(mm_cls, mm_cls_ema, args.ema_beta)
-                        else:
+                        elif split == 'val':
                             predict1, loss, predict1_ema, loss_ema = validate_one_step(clip, flow, spectrogram, labels, args, model_video, model_flow, model_audio, mm_cls, model_video_ema, model_flow_ema, model_audio_ema, mm_cls_ema, criterion)
                             _, predict_ema = torch.max(predict1_ema.detach().cpu(), dim=1)
                             acc1_ema = (predict_ema == labels).sum().item()
                             acc_ema += int(acc1_ema)
+                        else:
+                            # --log_target_each_epoch: diagnostic target-domain pass, never used for selection
+                            predict1, loss = test_one_step(clip, flow, spectrogram, labels, args, model_video_ema, model_flow_ema, model_audio_ema, mm_cls_ema, criterion)
 
                         total_loss += loss.item() * batch_size
                         _, predict = torch.max(predict1.detach().cpu(), dim=1)
@@ -630,9 +751,18 @@ if __name__ == '__main__':
                     if split == 'train':
                         f.write(f"epoch {epoch_i}\n")
                         f.write("{:5}, {}, {}\n".format(split, total_loss/float(count), acc/float(count)))
-                    else:
+                        if acc_stats.rows:
+                            keys, mean, std = acc_stats.summary()
+                            if epoch_i == 1:
+                                stats_f.write('epoch,' + ','.join(keys) + ','
+                                              + ','.join(k + '_std' for k in keys) + '\n')
+                            stats_f.write(f'{epoch_i},' + ','.join(f'{v:.5f}' for v in mean + std) + '\n')
+                            stats_f.flush()
+                    elif split == 'val':
                         f.write("{:5}, {}, {}, {}\n".format(split, total_loss / float(count), acc / float(count),
                                                           acc_ema / float(count)))
+                    else:
+                        f.write("tgt, {}, {}\n".format(total_loss / float(count), acc / float(count)))
                     f.flush()
 
             print('BestEpoch ', BestEpoch)
@@ -722,4 +852,13 @@ if __name__ == '__main__':
                 f.write("test {}, {}, {}\n".format(args.target_domain[1], total_loss/float(count), acc/float(count)))
                 f.flush()
 
-    f.close()
+        # The best checkpoint is only needed to run the test above.
+        if args.keep_checkpoint:
+            print('Checkpoint kept at', model_path)
+        else:
+            try:
+                os.remove(model_path)
+                print('Removed checkpoint', model_path)
+            except OSError as error:
+                print(f'Could not remove checkpoint {model_path}: {error}')
+
