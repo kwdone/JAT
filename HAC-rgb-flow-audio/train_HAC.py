@@ -3,7 +3,7 @@ import torch.utils.data
 from mmaction.apis import init_recognizer
 import torch
 import argparse
-import tqdm
+from tqdm.auto import tqdm   # notebook-aware: live widget bar in Jupyter, text bar in a shell
 import os
 import os.path as osp
 import numpy as np
@@ -706,7 +706,8 @@ if __name__ == '__main__':
                     model_flow.train(split == 'train')
                 if args.use_audio:
                     model_audio.train(split == 'train')
-                with tqdm.tqdm(total=len(dataloaders[split])) as pbar:
+                with tqdm(total=len(dataloaders[split]), desc=f'e{epoch_i} {split}',
+                          dynamic_ncols=True, leave=False, mininterval=1.0) as pbar:
                     for step_index, (clip, flow, spectrogram, labels, domain_labels) in enumerate(dataloaders[split]):
                         if split=='train':
                             predict1, loss, stats = train_one_step(
@@ -802,7 +803,8 @@ if __name__ == '__main__':
             acc = 0
             count = 0
             total_loss = 0
-            with tqdm.tqdm(total=len(test_dataloader)) as pbar:
+            with tqdm(total=len(test_dataloader), desc='test', dynamic_ncols=True,
+                      leave=False, mininterval=1.0) as pbar:
                 for (i, (clip, flow, spectrogram, labels, _)) in enumerate(test_dataloader):
                     predict1, loss = test_one_step(clip, flow, spectrogram, labels, args, model_video_ema, model_flow_ema, model_audio_ema, mm_cls_ema, criterion)
 
@@ -825,7 +827,8 @@ if __name__ == '__main__':
             acc = 0
             count = 0
             total_loss = 0
-            with tqdm.tqdm(total=len(test_dataloader1)) as pbar:
+            with tqdm(total=len(test_dataloader1), desc=str(args.target_domain[0]),
+                      dynamic_ncols=True, leave=False, mininterval=1.0) as pbar:
                 for (i, (clip, flow, spectrogram, labels, _)) in enumerate(test_dataloader1):
                     predict1, loss = test_one_step(clip, flow, spectrogram, labels, args, model_video_ema, model_flow_ema, model_audio_ema, mm_cls_ema, criterion)
 
@@ -847,7 +850,8 @@ if __name__ == '__main__':
             acc = 0
             count = 0
             total_loss = 0
-            with tqdm.tqdm(total=len(test_dataloader2)) as pbar:
+            with tqdm(total=len(test_dataloader2), desc=str(args.target_domain[1]),
+                      dynamic_ncols=True, leave=False, mininterval=1.0) as pbar:
                 for (i, (clip, flow, spectrogram, labels, _)) in enumerate(test_dataloader2):
                     predict1, loss = test_one_step(clip, flow, spectrogram, labels, args, model_video_ema, model_flow_ema, model_audio_ema, mm_cls_ema, criterion)
 
