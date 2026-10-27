@@ -166,7 +166,7 @@ def train_one_step(clip, flow, spectrogram, labels, domain_labels, args,
     loss.backward()
     optim.step()
 
-    stats = {'L_fusion': fusion_loss.detach()}
+    stats = {'L_fusion': fusion_loss.detach(), 'L_modal_adv': modal_adv_loss.detach()}
     for i, name in enumerate(modality_order):
         stats[f'Lcls_{name}'] = unimodal_losses[name].detach()
         stats[f'modacc_{name}'] = modal_acc[i]
@@ -175,6 +175,8 @@ def train_one_step(clip, flow, spectrogram, labels, domain_labels, args,
             stats[f'alpha_{name}'] = modality_weights[i].detach()
             stats[f'domacc_{name}'] = dom_acc[i]
     if args.num_domains > 1:
+        stats['L_dom_local'] = local_domain_loss.detach()   # already averaged over modalities
+        stats['L_dom_global'] = global_domain_loss.detach()
         stats['domacc_global'] = global_acc
     return mm_pred, loss, stats
 
