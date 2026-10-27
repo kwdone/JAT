@@ -454,6 +454,8 @@ if __name__ == '__main__':
     parser.add_argument('--tag', default='')               # keeps runs from overwriting each other
     parser.add_argument('--log_target_each_epoch', action='store_true')
     parser.add_argument('--check_leak', action='store_true')
+    parser.add_argument('--log_every', type=int, default=0,
+        help='also write a "prog,<epoch>,<step>,<loss>,<acc>" line every N train steps (0 = off)')
 
     # Hyperparameters
     parser.add_argument('--lr', type=float, default=1e-4)
@@ -632,6 +634,9 @@ if __name__ == '__main__':
         params = params + list(model_audio.audnet.layer4.parameters()) + list(a_cls.parameters())
 
     optim = torch.optim.Adam(params, lr=args.lr, weight_decay=1e-4)
+    print(f'[setup] optimising {sum(p.numel() for p in params)} parameters '
+          f'in {len(params)} tensors; modalities={args.num_modals}, '
+          f'domains={args.num_domains}', flush=True)
 
     BestLoss = float("inf")
     BestEpoch = args.BestEpoch
@@ -653,6 +658,8 @@ if __name__ == '__main__':
     dataloaders = {'train': train_dataloader, 'val': validate_dataloader}
     if args.log_target_each_epoch and len(args.target_domain) == 1:
         dataloaders['tgt'] = test_dataloader
+    print('[setup] batches: ' + ', '.join(f'{s}={len(d)}' for s, d in dataloaders.items())
+          + f'; log -> {log_path}', flush=True)
 
     with open(log_path, "w") as f, open(stats_path, "w") as stats_f:
         f.write(f"# git_commit {git_commit_hash()}\n")
@@ -686,7 +693,7 @@ if __name__ == '__main__':
                 count = 0
                 total_loss = 0
                 acc_ema = 0
-                print(split)
+                print(f'{split}: {len(dataloaders[split])} batches', flush=True)
                 mm_cls.train(split == 'train')
                 modal_projectors.train(split == 'train')
                 domain_projectors.train(split == 'train')
@@ -700,7 +707,7 @@ if __name__ == '__main__':
                 if args.use_audio:
                     model_audio.train(split == 'train')
                 with tqdm.tqdm(total=len(dataloaders[split])) as pbar:
-                    for (clip, flow, spectrogram, labels, domain_labels) in dataloaders[split]:
+                    for step_index, (clip, flow, spectrogram, labels, domain_labels) in enumerate(dataloaders[split]):
                         if split=='train':
                             predict1, loss, stats = train_one_step(
                                 clip, flow, spectrogram, labels, domain_labels, args,
@@ -730,6 +737,12 @@ if __name__ == '__main__':
                         count += predict1.size()[0]
                         pbar.set_postfix_str("Average loss: {:.4f}, Accuracy: {:.4f}".format(total_loss / float(count), acc / float(count)))
                         pbar.update()
+                        if split == 'train' and args.log_every and step_index % args.log_every == 0:
+                            # --log_every heartbeat: the per-split line is only written when a
+                            # whole split finishes, which can take many minutes per epoch.
+                            f.write("prog, {}, {}, {:.6f}, {:.6f}\n".format(
+                                epoch_i, step_index, total_loss / float(count), acc / float(count)))
+                            f.flush()
 
                     if split == 'val':
                         currentvalAcc = acc_ema / float(count)
