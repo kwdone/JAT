@@ -147,7 +147,20 @@ def train_one_step(clip, flow, spectrogram, labels, domain_labels, args,
             grad_reverse(global_embedding, args.alpha_domain))
         global_domain_loss = criterion(global_domain_logits, domain_labels)
         global_acc = (global_domain_logits.argmax(1) == domain_labels).float().mean().detach()
-        modality_weights = F.softmax(torch.stack(entropies) / args.weight_temperature, dim=0)
+
+        H = torch.stack(entropies)
+        T = args.weight_temperature
+        if args.weight_mode == 'entropy':            # released code (gradient flows through the weights)
+            modality_weights = F.softmax(H / T, dim=0)
+        elif args.weight_mode == 'entropy_detach':   # as the paper describes: weights treated as constants
+            modality_weights = F.softmax(H.detach() / T, dim=0)
+        elif args.weight_mode == 'inverted':
+            modality_weights = F.softmax(-H.detach() / T, dim=0)
+        elif args.weight_mode == 'shuffled':
+            w = F.softmax(H.detach() / T, dim=0)
+            modality_weights = w[torch.randperm(len(w), device=w.device)]
+        else:                                        # uniform
+            modality_weights = torch.full_like(H, 1.0 / len(H))
     else:
         modality_weights = torch.full(
             (num_modalities,), 1.0 / num_modalities, device=labels.device)
@@ -163,6 +176,13 @@ def train_one_step(clip, flow, spectrogram, labels, domain_labels, args,
     if args.num_domains > 1:
         loss = loss + args.domain_adv_loss_local * local_domain_loss
         loss = loss + args.domain_adv_loss_global * global_domain_loss
+
+    if args.check_leak:
+        check_gradient_leak(
+            (('video', model_video), ('flow', model_flow), ('audio', model_audio),
+             ('mm_cls', mm_cls), ('modal_disc', modal_disc), ('domain_disc', domain_disc),
+             ('domain_disc_global', domain_disc_global)),
+            optim)
 
     optim.zero_grad()
     loss.backward()
@@ -394,6 +414,40 @@ def update_ema(student, ema, decay):
         else:
             ema_value.copy_(student_value)
 
+_LEAK_STATE = {'checked': False, 'last': None}
+
+def check_gradient_leak(modules, optim):
+    """--check_leak diagnostic: report parameters that received a gradient but are
+    deliberately kept out of the optimizer (the "frozen" part of the backbones).
+
+    It is called just before optim.zero_grad(), so the gradients inspected are the
+    ones left behind by the previous step; the very first call only sees None and
+    is skipped. It reports the first leak-free step once and then stays quiet.
+    """
+    optimised = {id(p) for group in optim.param_groups for p in group['params']}
+    leaked, seen_any = [], False
+    for name, module in modules:
+        if module is None:
+            continue
+        for param_name, param in module.named_parameters():
+            if param.grad is None:
+                continue
+            seen_any = True
+            if id(param) not in optimised:
+                leaked.append(f'{name}.{param_name}')
+    if not seen_any:
+        return
+
+    if leaked:
+        signature = tuple(leaked)
+        if signature != _LEAK_STATE['last']:
+            shown = ', '.join(leaked[:5]) + (' ...' if len(leaked) > 5 else '')
+            print(f'[leak] {len(leaked)} frozen parameter(s) received a gradient: {shown}')
+            _LEAK_STATE['last'] = signature
+    elif not _LEAK_STATE['checked']:
+        print('[leak] no frozen parameter received a gradient')
+    _LEAK_STATE['checked'] = True
+
 def git_commit_hash():
     """Commit hash of the checkout, read straight from .git (no subprocess needed)."""
     try:
@@ -416,6 +470,12 @@ def git_commit_hash():
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
+
+    # Dynamic weighting controller (HAC parity: 'entropy' is the released behaviour)
+    parser.add_argument('--weight_mode', default='entropy',
+        choices=['entropy', 'entropy_detach', 'uniform', 'inverted', 'shuffled'])
+    parser.add_argument('--check_leak', action='store_true',
+        help='print "[leak] ..." lines when a parameter outside the optimizer receives a gradient')
 
     # Logging
     parser.add_argument('--tag', default='')               # keeps runs from overwriting each other
