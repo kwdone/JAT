@@ -15,10 +15,36 @@ from dataloader_DG_HAC import HACDOMAIN
 import torch.nn.functional as F
 import copy
 
-# from mmengine.logging import MMLogger
-# logger = MMLogger.get_instance(name="my_logger")
-# logger.setLevel('ERROR')
+# Logging layout -- same as EPIC-rgb-flow-audio/train_EPIC.py:
+#
+#   results/JAT/<single|multi>_source/<modalities>/<src>_to_<tgt>_seed<N>[_<tag>].csv
+#     # git_commit <sha>
+#     # args {...}
+#     epoch <i>
+#     train, <loss>, <acc>
+#     val  , <loss>, <acc>, <ema acc>
+#     tgt <domain>, <loss>, <acc>              # every epoch; on by default,
+#                                              # --no_log_target_each_epoch skips it
+#     prog , <epoch>, <step>, <loss>, <acc>    # --log_every N
+#     BestEpoch,<i>,BestLoss,<loss>,BestValAcc,<acc>
+#     test <domain>, <loss>, <acc>             # best-val checkpoint, EMA weights
+#
+#   results/JAT/.../<...>_seed<N>[_<tag>]_stats.csv
+#     epoch,<per-epoch mean of every train statistic>,<... _std>
+#
+# The per-epoch "tgt" lines are the target-domain test accuracy/loss, i.e. the
+# same numbers the final "test" lines report, only measured after every epoch
+# with the EMA weights of the checkpoint that validation is currently selecting.
+# They are diagnostics only: model selection stays on the source validation
+# split, exactly as before.
+#
+# With --no_ema there are no shadow weights: the "ema acc" column repeats the
+# student accuracy, selection uses it, and the per-epoch tgt pass plus the final
+# test run the student weights (the checkpoint then stores them under the
+# *_ema_state_dict keys and records ema_enabled=False).
+
 class StatAcc:
+    """Running mean/std of the per-step training statistics."""
     def __init__(self):
         self.rows, self.keys = [], None
     def add(self, stats):
@@ -218,6 +244,11 @@ def validate_one_step(clip, flow, spectrogram, labels, args, model_video, model_
 
         predict = mm_cls(feat)
         loss = criterion(predict, labels)
+
+    if not args.use_ema:
+        # --no_ema: there is no second set of weights, so the EMA prediction is the
+        # student prediction. Returning it keeps the caller (and the log columns) unchanged.
+        return predict, loss, predict, loss
 
     with torch.no_grad():
         if args.use_video:
@@ -452,8 +483,14 @@ if __name__ == '__main__':
     parser.add_argument('--weight_mode', default='entropy',
         choices=['entropy', 'entropy_detach', 'uniform', 'inverted', 'shuffled'])
     parser.add_argument('--tag', default='')               # keeps runs from overwriting each other
-    parser.add_argument('--log_target_each_epoch', action='store_true')
-    parser.add_argument('--check_leak', action='store_true')
+    parser.add_argument('--log_target_each_epoch', action='store_true', default=True,
+        help='evaluate the target domain with the EMA weights after every epoch and write '
+             '"tgt <domain>, <loss>, <acc>" lines (default: on; pass '
+             '--no_log_target_each_epoch to skip this extra pass)')
+    parser.add_argument('--no_log_target_each_epoch', dest='log_target_each_epoch',
+        action='store_false', help='disable the per-epoch target-domain evaluation')
+    parser.add_argument('--check_leak', action='store_true',
+        help='print "[leak] ..." lines when a parameter outside the optimizer receives a gradient')
     parser.add_argument('--log_every', type=int, default=0,
         help='also write a "prog,<epoch>,<step>,<loss>,<acc>" line every N train steps (0 = off)')
 
@@ -463,7 +500,11 @@ if __name__ == '__main__':
     parser.add_argument("--nepochs", type=int, default=20)
     parser.add_argument("--hidden_dim", type=int, default=2048)
     parser.add_argument('--use_dsu', action='store_true', help="Enable DSU: UNCERTAINTY MODELING FOR OUT-OF-DISTRIBUTION GENERALIZATION")
-    parser.add_argument('--ema_beta', type=float, default=0.999)
+    parser.add_argument('--ema_beta', type=float, default=0.999,
+        help='EMA decay (ignored with --no_ema)')
+    parser.add_argument('--no_ema', action='store_true',
+        help='disable the EMA shadow models: no deep copies and no EMA updates, so '
+             'validation selection and the final test use the student weights directly')
     parser.add_argument('--modality_dropout', type=float, default=0.5)
     parser.add_argument('--project_out_dim', type=int, default=512)
     parser.add_argument('--alpha_modal', type=float, default=0.1)
@@ -500,6 +541,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     args.num_modals = sum((args.use_video, args.use_audio, args.use_flow))
     args.num_domains = len(args.source_domain)
+    args.use_ema = not args.no_ema
     if args.num_modals < 2:
         parser.error('At least two modalities must be enabled.')
     if args.weight_temperature <= 0:
@@ -634,9 +676,14 @@ if __name__ == '__main__':
         params = params + list(model_audio.audnet.layer4.parameters()) + list(a_cls.parameters())
 
     optim = torch.optim.Adam(params, lr=args.lr, weight_decay=1e-4)
+    ema_state = f'on (beta {args.ema_beta})' if args.use_ema else 'off'
     print(f'[setup] optimising {sum(p.numel() for p in params)} parameters '
           f'in {len(params)} tensors; modalities={args.num_modals}, '
-          f'domains={args.num_domains}', flush=True)
+          f'domains={args.num_domains}, ema={ema_state}', flush=True)
+    if not args.use_ema:
+        print('[setup] --no_ema: no shadow copies, no EMA updates; validation '
+              'selection, the per-epoch tgt pass and the final test all use the '
+              'student weights', flush=True)
 
     BestLoss = float("inf")
     BestEpoch = args.BestEpoch
@@ -647,17 +694,16 @@ if __name__ == '__main__':
     train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, num_workers=args.num_workers, shuffle=True, pin_memory=True, drop_last=True)
     validate_dataset = HACDOMAIN(split='test', source=True, domain=args.source_domain, cfg_video=cfg_video, cfg_flow=cfg_flow, datapath=args.datapath, use_video=args.use_video, use_flow=args.use_flow, use_audio=args.use_audio)
     validate_dataloader = torch.utils.data.DataLoader(validate_dataset, batch_size=batch_size, num_workers=args.num_workers, shuffle=False, pin_memory=True, drop_last=False)
-    if len(args.target_domain) == 1:
-        test_dataset = HACDOMAIN(split='test', source=False, domain=args.target_domain, cfg_video=cfg_video, cfg_flow=cfg_flow, datapath=args.datapath, use_video=args.use_video, use_flow=args.use_flow, use_audio=args.use_audio)
-        test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, num_workers=args.num_workers, shuffle=False, pin_memory=True, drop_last=False)
-    else:
-        test_dataset1 = HACDOMAIN(split='test', source=False, domain=args.target_domain[0:1], cfg_video=cfg_video, cfg_flow=cfg_flow, datapath=args.datapath, use_video=args.use_video, use_flow=args.use_flow, use_audio=args.use_audio)
-        test_dataset2 = HACDOMAIN(split='test', source=False, domain=args.target_domain[1:], cfg_video=cfg_video, cfg_flow=cfg_flow, datapath=args.datapath, use_video=args.use_video, use_flow=args.use_flow, use_audio=args.use_audio)
-        test_dataloader1 = torch.utils.data.DataLoader(test_dataset1, batch_size=batch_size, num_workers=args.num_workers, shuffle=False, pin_memory=True, drop_last=False)
-        test_dataloader2 = torch.utils.data.DataLoader(test_dataset2, batch_size=batch_size, num_workers=args.num_workers, shuffle=False, pin_memory=True, drop_last=False)
+    # One loader per target domain, built exactly like the final test pass.
+    target_loaders = {}
+    for target_name in args.target_domain:
+        target_dataset = HACDOMAIN(split='test', source=False, domain=[target_name], cfg_video=cfg_video, cfg_flow=cfg_flow, datapath=args.datapath, use_video=args.use_video, use_flow=args.use_flow, use_audio=args.use_audio)
+        target_loaders[target_name] = torch.utils.data.DataLoader(target_dataset, batch_size=batch_size, num_workers=args.num_workers, shuffle=False, pin_memory=True, drop_last=False)
+
     dataloaders = {'train': train_dataloader, 'val': validate_dataloader}
-    if args.log_target_each_epoch and len(args.target_domain) == 1:
-        dataloaders['tgt'] = test_dataloader
+    if args.log_target_each_epoch:
+        for target_name, loader in target_loaders.items():
+            dataloaders[f'tgt:{target_name}'] = loader
     print('[setup] batches: ' + ', '.join(f'{s}={len(d)}' for s, d in dataloaders.items())
           + f'; log -> {log_path}', flush=True)
 
@@ -667,122 +713,143 @@ if __name__ == '__main__':
         f.flush()
 
         # ema model
+        # With --no_ema the "ema" handles are the student modules themselves; every
+        # evaluation path then runs the current weights, the way the released code
+        # evaluates the EMA ones.
         if args.use_video:
-            model_video_ema = copy.deepcopy(model_video)
+            model_video_ema = copy.deepcopy(model_video) if args.use_ema else model_video
             model_video_ema.eval()
         else:
             model_video_ema = None
         if args.use_flow:
-            model_flow_ema = copy.deepcopy(model_flow)
+            model_flow_ema = copy.deepcopy(model_flow) if args.use_ema else model_flow
             model_flow_ema.eval()
         else:
             model_flow_ema = None
         if args.use_audio:
-            model_audio_ema = copy.deepcopy(model_audio)
+            model_audio_ema = copy.deepcopy(model_audio) if args.use_ema else model_audio
             model_audio_ema.eval()
         else:
             model_audio_ema = None
-        mm_cls_ema = copy.deepcopy(mm_cls)
+        mm_cls_ema = copy.deepcopy(mm_cls) if args.use_ema else mm_cls
         mm_cls_ema.eval()
         # iteration
         for epoch_i in range(1, args.nepochs+1):
-            print("Epoch: %02d" % epoch_i)
+            print("Epoch: %02d" % epoch_i, flush=True)
             acc_stats = StatAcc()
-            for split in [s for s in ('train', 'val', 'tgt') if s in dataloaders]:
+            epoch_metrics = {}
+            for split in dataloaders:
+                is_train = split == 'train'
+                is_val = split == 'val'
                 acc = 0
                 count = 0
                 total_loss = 0
                 acc_ema = 0
                 print(f'{split}: {len(dataloaders[split])} batches', flush=True)
-                mm_cls.train(split == 'train')
-                modal_projectors.train(split == 'train')
-                domain_projectors.train(split == 'train')
-                modal_disc.train(split == 'train')
-                domain_disc.train(split == 'train')
-                domain_disc_global.train(split == 'train')
+                mm_cls.train(is_train)
+                modal_projectors.train(is_train)
+                domain_projectors.train(is_train)
+                modal_disc.train(is_train)
+                domain_disc.train(is_train)
+                domain_disc_global.train(is_train)
                 if args.use_video:
-                    model_video.train(split == 'train')
+                    model_video.train(is_train)
                 if args.use_flow:
-                    model_flow.train(split == 'train')
+                    model_flow.train(is_train)
                 if args.use_audio:
-                    model_audio.train(split == 'train')
+                    model_audio.train(is_train)
                 with tqdm(total=len(dataloaders[split]), desc=f'e{epoch_i} {split}',
                           dynamic_ncols=True, leave=False, mininterval=1.0) as pbar:
                     for step_index, (clip, flow, spectrogram, labels, domain_labels) in enumerate(dataloaders[split]):
-                        if split=='train':
+                        batch_count = labels.size(0)
+                        if is_train:
                             predict1, loss, stats = train_one_step(
                                 clip, flow, spectrogram, labels, domain_labels, args,
                                 model_video, model_flow, model_audio, mm_cls,
                                 criterion, optim)
                             acc_stats.add(stats)
-                            if args.use_video:
-                                update_ema(model_video, model_video_ema, args.ema_beta)
-                            if args.use_flow:
-                                update_ema(model_flow, model_flow_ema, args.ema_beta)
-                            if args.use_audio:
-                                update_ema(model_audio, model_audio_ema, args.ema_beta)
-                            update_ema(mm_cls, mm_cls_ema, args.ema_beta)
-                        elif split == 'val':
+                            if args.use_ema:
+                                if args.use_video:
+                                    update_ema(model_video, model_video_ema, args.ema_beta)
+                                if args.use_flow:
+                                    update_ema(model_flow, model_flow_ema, args.ema_beta)
+                                if args.use_audio:
+                                    update_ema(model_audio, model_audio_ema, args.ema_beta)
+                                update_ema(mm_cls, mm_cls_ema, args.ema_beta)
+                        elif is_val:
                             predict1, loss, predict1_ema, loss_ema = validate_one_step(clip, flow, spectrogram, labels, args, model_video, model_flow, model_audio, mm_cls, model_video_ema, model_flow_ema, model_audio_ema, mm_cls_ema, criterion)
                             _, predict_ema = torch.max(predict1_ema.detach().cpu(), dim=1)
-                            acc1_ema = (predict_ema == labels).sum().item()
-                            acc_ema += int(acc1_ema)
+                            acc_ema += int((predict_ema == labels).sum().item())
                         else:
-                            # --log_target_each_epoch: diagnostic target-domain pass, never used for selection
+                            # --log_target_each_epoch: target-domain diagnostic pass with the
+                            # EMA weights the final test will use; never used for selection
                             predict1, loss = test_one_step(clip, flow, spectrogram, labels, args, model_video_ema, model_flow_ema, model_audio_ema, mm_cls_ema, criterion)
 
-                        total_loss += loss.item() * batch_size
+                        total_loss += loss.item() * batch_count
                         _, predict = torch.max(predict1.detach().cpu(), dim=1)
-                        acc1 = (predict == labels).sum().item()
-                        acc += int(acc1)
-                        count += predict1.size()[0]
+                        acc += int((predict == labels).sum().item())
+                        count += predict1.size(0)
                         pbar.set_postfix_str("Average loss: {:.4f}, Accuracy: {:.4f}".format(total_loss / float(count), acc / float(count)))
                         pbar.update()
-                        if split == 'train' and args.log_every and step_index % args.log_every == 0:
+                        if is_train and args.log_every and step_index % args.log_every == 0:
                             # --log_every heartbeat: the per-split line is only written when a
                             # whole split finishes, which can take many minutes per epoch.
                             f.write("prog, {}, {}, {:.6f}, {:.6f}\n".format(
                                 epoch_i, step_index, total_loss / float(count), acc / float(count)))
                             f.flush()
 
-                    if split == 'val':
-                        currentvalAcc = acc_ema / float(count)
-                        if currentvalAcc >= BestValAcc:
-                            BestLoss = total_loss / float(count)
-                            BestEpoch = epoch_i
-                            BestValAcc = currentvalAcc
-                            save = {
-                                'BestEpoch': BestEpoch,
-                                'BestValAcc': BestValAcc,
-                            }
-                            save['mm_cls_ema_state_dict'] = mm_cls_ema.state_dict()
-                            if args.use_video:
-                                save['model_video_ema_state_dict'] = model_video_ema.state_dict()
-                            if args.use_flow:
-                                save['model_flow_ema_state_dict'] = model_flow_ema.state_dict()
-                            if args.use_audio:
-                                save['model_audio_ema_state_dict'] = model_audio_ema.state_dict()
-                            torch.save(save, model_path)
+                split_loss = total_loss / float(count) if count else float('nan')
+                split_acc = acc / float(count) if count else float('nan')
+                epoch_metrics[split] = {'loss': split_loss, 'acc': split_acc}
+                if is_val:
+                    split_acc_ema = acc_ema / float(count) if count else 0.0
+                    epoch_metrics[split]['acc_ema'] = split_acc_ema
 
-                    if split == 'train':
-                        f.write(f"epoch {epoch_i}\n")
-                        f.write("{:5}, {}, {}\n".format(split, total_loss/float(count), acc/float(count)))
-                        if acc_stats.rows:
-                            keys, mean, std = acc_stats.summary()
-                            if epoch_i == 1:
-                                stats_f.write('epoch,' + ','.join(keys) + ','
-                                              + ','.join(k + '_std' for k in keys) + '\n')
-                            stats_f.write(f'{epoch_i},' + ','.join(f'{v:.5f}' for v in mean + std) + '\n')
-                            stats_f.flush()
-                    elif split == 'val':
-                        f.write("{:5}, {}, {}, {}\n".format(split, total_loss / float(count), acc / float(count),
-                                                          acc_ema / float(count)))
-                    else:
-                        f.write("tgt, {}, {}\n".format(total_loss / float(count), acc / float(count)))
-                    f.flush()
+                    currentvalAcc = split_acc_ema
+                    if currentvalAcc >= BestValAcc:
+                        BestLoss = split_loss
+                        BestEpoch = epoch_i
+                        BestValAcc = currentvalAcc
+                        save = {
+                            'BestEpoch': BestEpoch,
+                            'BestValAcc': BestValAcc,
+                            # False means the *_ema_state_dict entries hold the student
+                            # weights (see --no_ema); keep the keys so loading is uniform.
+                            'ema_enabled': args.use_ema,
+                        }
+                        save['mm_cls_ema_state_dict'] = mm_cls_ema.state_dict()
+                        if args.use_video:
+                            save['model_video_ema_state_dict'] = model_video_ema.state_dict()
+                        if args.use_flow:
+                            save['model_flow_ema_state_dict'] = model_flow_ema.state_dict()
+                        if args.use_audio:
+                            save['model_audio_ema_state_dict'] = model_audio_ema.state_dict()
+                        torch.save(save, model_path)
 
-            print('BestEpoch ', BestEpoch)
-            print('BestValAcc ', BestValAcc)
+                if is_train:
+                    f.write(f"epoch {epoch_i}\n")
+                    f.write("{:5}, {}, {}\n".format(split, split_loss, split_acc))
+                    if acc_stats.rows:
+                        keys, mean, std = acc_stats.summary()
+                        if epoch_i == 1:
+                            stats_f.write('epoch,' + ','.join(keys) + ','
+                                          + ','.join(k + '_std' for k in keys) + '\n')
+                        stats_f.write(f'{epoch_i},' + ','.join(f'{v:.5f}' for v in mean + std) + '\n')
+                        stats_f.flush()
+                elif is_val:
+                    f.write("{:5}, {}, {}, {}\n".format(split, split_loss, split_acc, split_acc_ema))
+                else:
+                    f.write("tgt {}, {}, {}\n".format(split[len('tgt:'):], split_loss, split_acc))
+                f.flush()
+
+            summary = []
+            for split, metrics in epoch_metrics.items():
+                text = f"{split} loss={metrics['loss']:.4f} acc={metrics['acc']:.4f}"
+                if 'acc_ema' in metrics:
+                    text += f" acc_ema={metrics['acc_ema']:.4f}"
+                summary.append(text)
+            print(f'[epoch {epoch_i:02d}] ' + ' | '.join(summary), flush=True)
+            print('BestEpoch ', BestEpoch, '| BestValAcc ', BestValAcc, flush=True)
 
         f.write("BestEpoch,{},BestLoss,{},BestValAcc,{} \n".format(BestEpoch, BestLoss, BestValAcc))
         f.flush()
@@ -798,78 +865,37 @@ if __name__ == '__main__':
             model_audio_ema.load_state_dict(ckt['model_audio_ema_state_dict'])
 
         # test
-        print('test')
-        if len(args.target_domain) == 1:
+        print('test', flush=True)
+        # With EMA on these are the shadow models (always eval); with --no_ema they are
+        # the student modules, which the loop left in train() mode for the last split.
+        for eval_model in (mm_cls_ema, model_video_ema, model_flow_ema, model_audio_ema):
+            if eval_model is not None:
+                eval_model.eval()
+        for target_name, loader in target_loaders.items():
             acc = 0
             count = 0
             total_loss = 0
-            with tqdm(total=len(test_dataloader), desc='test', dynamic_ncols=True,
+            with tqdm(total=len(loader), desc=f'test {target_name}', dynamic_ncols=True,
                       leave=False, mininterval=1.0) as pbar:
-                for (i, (clip, flow, spectrogram, labels, _)) in enumerate(test_dataloader):
+                for (clip, flow, spectrogram, labels, _) in loader:
                     predict1, loss = test_one_step(clip, flow, spectrogram, labels, args, model_video_ema, model_flow_ema, model_audio_ema, mm_cls_ema, criterion)
 
-                    total_loss += loss.item() * batch_size
+                    total_loss += loss.item() * labels.size(0)
                     _, predict = torch.max(predict1.detach().cpu(), dim=1)
 
-                    acc1 = (predict == labels).sum().item()
-                    acc += int(acc1)
-                    count += predict1.size()[0]
+                    acc += int((predict == labels).sum().item())
+                    count += predict1.size(0)
                     pbar.set_postfix_str(
                         "Average loss: {:.4f}, Current loss: {:.4f}, Accuracy: {:.4f}".format(total_loss / float(count),
                                                                                                 loss.item(),
                                                                                                 acc / float(count)))
                     pbar.update()
 
-                print('TestAcc ', acc/float(count))
-                f.write("test , {}, {}\n".format(total_loss/float(count), acc/float(count)))
-                f.flush()
-        else:
-            acc = 0
-            count = 0
-            total_loss = 0
-            with tqdm(total=len(test_dataloader1), desc=str(args.target_domain[0]),
-                      dynamic_ncols=True, leave=False, mininterval=1.0) as pbar:
-                for (i, (clip, flow, spectrogram, labels, _)) in enumerate(test_dataloader1):
-                    predict1, loss = test_one_step(clip, flow, spectrogram, labels, args, model_video_ema, model_flow_ema, model_audio_ema, mm_cls_ema, criterion)
-
-                    total_loss += loss.item() * batch_size
-                    _, predict = torch.max(predict1.detach().cpu(), dim=1)
-
-                    acc1 = (predict == labels).sum().item()
-                    acc += int(acc1)
-                    count += predict1.size()[0]
-                    pbar.set_postfix_str(
-                        "Average loss: {:.4f}, Current loss: {:.4f}, Accuracy: {:.4f}".format(total_loss / float(count),
-                                                                                                loss.item(),
-                                                                                                acc / float(count)))
-                    pbar.update()
-
-                print(f'Test {args.target_domain[0]} ', acc/float(count))
-                f.write("test {}, {}, {}\n".format(args.target_domain[0], total_loss/float(count), acc/float(count)))
-                f.flush()
-            acc = 0
-            count = 0
-            total_loss = 0
-            with tqdm(total=len(test_dataloader2), desc=str(args.target_domain[1]),
-                      dynamic_ncols=True, leave=False, mininterval=1.0) as pbar:
-                for (i, (clip, flow, spectrogram, labels, _)) in enumerate(test_dataloader2):
-                    predict1, loss = test_one_step(clip, flow, spectrogram, labels, args, model_video_ema, model_flow_ema, model_audio_ema, mm_cls_ema, criterion)
-
-                    total_loss += loss.item() * batch_size
-                    _, predict = torch.max(predict1.detach().cpu(), dim=1)
-
-                    acc1 = (predict == labels).sum().item()
-                    acc += int(acc1)
-                    count += predict1.size()[0]
-                    pbar.set_postfix_str(
-                        "Average loss: {:.4f}, Current loss: {:.4f}, Accuracy: {:.4f}".format(total_loss / float(count),
-                                                                                                loss.item(),
-                                                                                                acc / float(count)))
-                    pbar.update()
-
-                print(f'Test {args.target_domain[1]} ', acc/float(count))
-                f.write("test {}, {}, {}\n".format(args.target_domain[1], total_loss/float(count), acc/float(count)))
-                f.flush()
+            test_loss = total_loss / float(count) if count else float('nan')
+            test_acc = acc / float(count) if count else float('nan')
+            print(f'Test {target_name} loss={test_loss:.4f} acc={test_acc:.4f}', flush=True)
+            f.write("test {}, {}, {}\n".format(target_name, test_loss, test_acc))
+            f.flush()
 
         # The best checkpoint is only needed to run the test above.
         if args.keep_checkpoint:
