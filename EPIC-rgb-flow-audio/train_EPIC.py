@@ -37,6 +37,11 @@ import copy
 # with the EMA weights of the checkpoint that validation is currently selecting.
 # They are diagnostics only: model selection stays on the source validation
 # split, exactly as before.
+#
+# With --no_ema there are no shadow weights: the "ema acc" column repeats the
+# student accuracy, selection uses it, and the per-epoch tgt pass plus the final
+# test run the student weights (the checkpoint then stores them under the
+# *_ema_state_dict keys and records ema_enabled=False).
 
 class StatAcc:
     """Running mean/std of the per-step training statistics."""
@@ -240,6 +245,11 @@ def validate_one_step(clip, flow, spectrogram, labels, args, model_video, model_
 
         predict = mm_cls(feat)
         loss = criterion(predict, labels)
+
+    if not args.use_ema:
+        # --no_ema: there is no second set of weights, so the EMA prediction is the
+        # student prediction. Returning it keeps the caller (and the log columns) unchanged.
+        return predict, loss, predict, loss
 
     with torch.no_grad():
         if args.use_video:
@@ -494,7 +504,11 @@ if __name__ == '__main__':
     parser.add_argument("--nepochs", type=int, default=20)
     parser.add_argument("--hidden_dim", type=int, default=2048)
     parser.add_argument('--use_dsu', action='store_true', help="Enable DSU: UNCERTAINTY MODELING FOR OUT-OF-DISTRIBUTION GENERALIZATION")
-    parser.add_argument('--ema_beta', type=float, default=0.999)
+    parser.add_argument('--ema_beta', type=float, default=0.999,
+        help='EMA decay (ignored with --no_ema)')
+    parser.add_argument('--no_ema', action='store_true',
+        help='disable the EMA shadow models: no deep copies and no EMA updates, so '
+             'validation selection and the final test use the student weights directly')
     parser.add_argument('--modality_dropout', type=float, default=0.5)
     parser.add_argument('--project_out_dim', type=int, default=512)
     parser.add_argument('--alpha_modal', type=float, default=0.1)
@@ -529,6 +543,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     args.num_modals = sum((args.use_video, args.use_audio, args.use_flow))
     args.num_domains = len(args.source_domain)
+    args.use_ema = not args.no_ema
     if args.num_modals < 2:
         parser.error('At least two modalities must be enabled.')
     if args.weight_temperature <= 0:
@@ -661,9 +676,14 @@ if __name__ == '__main__':
         params = params + list(model_audio.audnet.layer4.parameters()) + list(a_cls.parameters())
 
     optim = torch.optim.Adam(params, lr=args.lr, weight_decay=1e-4)
+    ema_state = f'on (beta {args.ema_beta})' if args.use_ema else 'off'
     print(f'[setup] optimising {sum(p.numel() for p in params)} parameters '
           f'in {len(params)} tensors; modalities={args.num_modals}, '
-          f'domains={args.num_domains}', flush=True)
+          f'domains={args.num_domains}, ema={ema_state}', flush=True)
+    if not args.use_ema:
+        print('[setup] --no_ema: no shadow copies, no EMA updates; validation '
+              'selection, the per-epoch tgt pass and the final test all use the '
+              'student weights', flush=True)
 
     BestLoss = float("inf")
     BestEpoch = args.BestEpoch
@@ -694,22 +714,25 @@ if __name__ == '__main__':
         f.flush()
 
         # ema model
+        # With --no_ema the "ema" handles are the student modules themselves; every
+        # evaluation path then runs the current weights, the way the released code
+        # evaluates the EMA ones.
         if args.use_video:
-            model_video_ema = copy.deepcopy(model_video)
+            model_video_ema = copy.deepcopy(model_video) if args.use_ema else model_video
             model_video_ema.eval()
         else:
             model_video_ema = None
         if args.use_flow:
-            model_flow_ema = copy.deepcopy(model_flow)
+            model_flow_ema = copy.deepcopy(model_flow) if args.use_ema else model_flow
             model_flow_ema.eval()
         else:
             model_flow_ema = None
         if args.use_audio:
-            model_audio_ema = copy.deepcopy(model_audio)
+            model_audio_ema = copy.deepcopy(model_audio) if args.use_ema else model_audio
             model_audio_ema.eval()
         else:
             model_audio_ema = None
-        mm_cls_ema = copy.deepcopy(mm_cls)
+        mm_cls_ema = copy.deepcopy(mm_cls) if args.use_ema else mm_cls
         mm_cls_ema.eval()
         # iteration
         for epoch_i in range(1, args.nepochs+1):
@@ -746,13 +769,14 @@ if __name__ == '__main__':
                                 model_video, model_flow, model_audio, mm_cls,
                                 criterion, optim)
                             acc_stats.add(stats)
-                            if args.use_video:
-                                update_ema(model_video, model_video_ema, args.ema_beta)
-                            if args.use_flow:
-                                update_ema(model_flow, model_flow_ema, args.ema_beta)
-                            if args.use_audio:
-                                update_ema(model_audio, model_audio_ema, args.ema_beta)
-                            update_ema(mm_cls, mm_cls_ema, args.ema_beta)
+                            if args.use_ema:
+                                if args.use_video:
+                                    update_ema(model_video, model_video_ema, args.ema_beta)
+                                if args.use_flow:
+                                    update_ema(model_flow, model_flow_ema, args.ema_beta)
+                                if args.use_audio:
+                                    update_ema(model_audio, model_audio_ema, args.ema_beta)
+                                update_ema(mm_cls, mm_cls_ema, args.ema_beta)
                         elif is_val:
                             predict1, loss, predict1_ema, loss_ema = validate_one_step(clip, flow, spectrogram, labels, args, model_video, model_flow, model_audio, mm_cls, model_video_ema, model_flow_ema, model_audio_ema, mm_cls_ema, criterion)
                             _, predict_ema = torch.max(predict1_ema.detach().cpu(), dim=1)
@@ -790,6 +814,9 @@ if __name__ == '__main__':
                         save = {
                             'BestEpoch': BestEpoch,
                             'BestValAcc': BestValAcc,
+                            # False means the *_ema_state_dict entries hold the student
+                            # weights (see --no_ema); keep the keys so loading is uniform.
+                            'ema_enabled': args.use_ema,
                         }
                         save['mm_cls_ema_state_dict'] = mm_cls_ema.state_dict()
                         if args.use_video:
@@ -840,6 +867,11 @@ if __name__ == '__main__':
 
         # test
         print('test', flush=True)
+        # With EMA on these are the shadow models (always eval); with --no_ema they are
+        # the student modules, which the loop left in train() mode for the last split.
+        for eval_model in (mm_cls_ema, model_video_ema, model_flow_ema, model_audio_ema):
+            if eval_model is not None:
+                eval_model.eval()
         for target_name, loader in target_loaders.items():
             acc = 0
             count = 0
