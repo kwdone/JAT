@@ -42,6 +42,11 @@ import copy
 # student accuracy, selection uses it, and the per-epoch tgt pass plus the final
 # test run the student weights (the checkpoint then stores them under the
 # *_ema_state_dict keys and records ema_enabled=False).
+#
+# With --no_modal_adv the modality-adversarial branch (GRL, per-modality
+# projectors, modal_disc) is removed from the forward pass, the loss and the
+# optimizer, so the *_stats.csv omits L_modal_adv and modacc_* rather than
+# logging zeros.
 
 class StatAcc:
     """Running mean/std of the per-step training statistics."""
@@ -128,11 +133,12 @@ def train_one_step(clip, flow, spectrogram, labels, domain_labels, args,
 
     for modal_idx, modal_name in enumerate(modality_order):
         embedding = embeddings[modal_name]
-        modal_logits = modal_disc(
-            modal_projectors[modal_name](grad_reverse(embedding, args.alpha_modal)))
-        modal_labels = torch.full_like(labels, modal_idx)
-        modal_adv_loss = modal_adv_loss + criterion(modal_logits, modal_labels)
-        modal_acc.append((modal_logits.argmax(1) == modal_labels).float().mean().detach())
+        if args.use_modal_adv:
+            modal_logits = modal_disc(
+                modal_projectors[modal_name](grad_reverse(embedding, args.alpha_modal)))
+            modal_labels = torch.full_like(labels, modal_idx)
+            modal_adv_loss = modal_adv_loss + criterion(modal_logits, modal_labels)
+            modal_acc.append((modal_logits.argmax(1) == modal_labels).float().mean().detach())
 
         if args.num_domains > 1:
             domain_logits = domain_disc(
@@ -177,7 +183,8 @@ def train_one_step(clip, flow, spectrogram, labels, domain_labels, args,
         for idx, name in enumerate(modality_order))
 
     loss = fusion_loss + args.cls_loss * weighted_unimodal_loss
-    loss = loss + args.modal_adv_loss * modal_adv_loss
+    if args.use_modal_adv:
+        loss = loss + args.modal_adv_loss * modal_adv_loss
     if args.num_domains > 1:
         loss = loss + args.domain_adv_loss_local * local_domain_loss
         loss = loss + args.domain_adv_loss_global * global_domain_loss
@@ -193,10 +200,13 @@ def train_one_step(clip, flow, spectrogram, labels, domain_labels, args,
     loss.backward()
     optim.step()
 
-    stats = {'L_fusion': fusion_loss.detach(), 'L_modal_adv': modal_adv_loss.detach()}
+    stats = {'L_fusion': fusion_loss.detach()}
+    if args.use_modal_adv:
+        stats['L_modal_adv'] = modal_adv_loss.detach()
     for i, name in enumerate(modality_order):
         stats[f'Lcls_{name}'] = unimodal_losses[name].detach()
-        stats[f'modacc_{name}'] = modal_acc[i]
+        if args.use_modal_adv:
+            stats[f'modacc_{name}'] = modal_acc[i]
         if args.num_domains > 1:
             stats[f'H_{name}'] = entropies[i].detach()
             stats[f'alpha_{name}'] = modality_weights[i].detach()
@@ -516,6 +526,10 @@ if __name__ == '__main__':
     parser.add_argument('--weight_temperature', type=float, default=1.0)
     parser.add_argument('--cls_loss', type=float, default=1.0)
     parser.add_argument('--modal_adv_loss', type=float, default=0.1)
+    parser.add_argument('--no_modal_adv', action='store_true',
+        help='drop the modality-adversarial branch entirely (GRL + per-modality projectors '
+             '+ modal_disc, and its loss term); the L_modal_adv/modacc_* stats are then '
+             'omitted instead of being logged as zeros')
     parser.add_argument('--domain_adv_loss_local', type=float, default=0.5)
     parser.add_argument('--domain_adv_loss_global', type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=0)
@@ -544,6 +558,7 @@ if __name__ == '__main__':
     args.num_modals = sum((args.use_video, args.use_audio, args.use_flow))
     args.num_domains = len(args.source_domain)
     args.use_ema = not args.no_ema
+    args.use_modal_adv = not args.no_modal_adv
     if args.num_modals < 2:
         parser.error('At least two modalities must be enabled.')
     if args.weight_temperature <= 0:
@@ -665,9 +680,13 @@ if __name__ == '__main__':
 
     criterion = nn.CrossEntropyLoss()
 
-    params = (list(mm_cls.parameters()) + list(modal_projectors.parameters())
-              + list(domain_projectors.parameters()) + list(modal_disc.parameters())
+    params = (list(mm_cls.parameters())
+              + list(domain_projectors.parameters())
               + list(domain_disc.parameters()) + list(domain_disc_global.parameters()))
+    if args.use_modal_adv:
+        # --no_modal_adv removes these from the optimizer as well, so the setup line
+        # reports the parameters that actually train.
+        params = params + list(modal_projectors.parameters()) + list(modal_disc.parameters())
     if args.use_video:
         params = params + list(model_video.module.backbone.fast_path.layer4.parameters()) + list(model_video.module.backbone.slow_path.layer4.parameters()) + list(v_cls.parameters())
     if args.use_flow:
@@ -679,11 +698,16 @@ if __name__ == '__main__':
     ema_state = f'on (beta {args.ema_beta})' if args.use_ema else 'off'
     print(f'[setup] optimising {sum(p.numel() for p in params)} parameters '
           f'in {len(params)} tensors; modalities={args.num_modals}, '
-          f'domains={args.num_domains}, ema={ema_state}', flush=True)
+          f'domains={args.num_domains}, ema={ema_state}, '
+          f'modal_adv={"on" if args.use_modal_adv else "off"}', flush=True)
     if not args.use_ema:
         print('[setup] --no_ema: no shadow copies, no EMA updates; validation '
               'selection, the per-epoch tgt pass and the final test all use the '
               'student weights', flush=True)
+    if not args.use_modal_adv:
+        print('[setup] --no_modal_adv: modality-adversarial branch removed; the loss is '
+              'fusion + weighted unimodal only (plus the domain terms when there are '
+              '2+ source domains)', flush=True)
 
     BestLoss = float("inf")
     BestEpoch = args.BestEpoch
